@@ -124,7 +124,7 @@ public class RiStdfToWideTables implements RecordVisitor {
           String fieldName=(String)_fieldNames.get(i);
           sb.append(fieldName).append(" TEXT"); //note: the data type is useful for Postgres. Not so much needed for sqlite
         }
-        sb.append(");"); //finish it off
+        sb.append(", record NUMBER);"); //TODO finish it off by adding a columm for recordNum
         //System.out.println(sb.toString());
         if(cnt != 0) _sqlStatement.executeUpdate(sb.toString()); //create table
       }
@@ -136,13 +136,19 @@ public class RiStdfToWideTables implements RecordVisitor {
         StringBuffer sb=new StringBuffer("insert into " + tableName + " values (");
 
         if(cnt > 0) sb.append("?"); //first one
-        for(int i=1; i < cnt; i++)
+        for(int i=1; i < cnt + 1; i++)  // TODO add spot for record
           sb.append(",?");
         sb.append(");"); //finish it off
           prep=_sqlConnection.prepareStatement(sb.toString()); //prepared statement: "insert into table..."
         _prepStatements.put(recordType, prep); //save for next time
+      }else if(prep == null && cnt == 0){
+          StringBuffer sb=new StringBuffer("insert into " + tableName + " values (");
+          if(cnt > 0) sb.append("?"); //first one
+          sb.append(");"); //finish it off
+            prep=_sqlConnection.prepareStatement(sb.toString()); //prepared statement: "insert into table..."
+          _prepStatements.put(recordType, prep); //save for next time
       }
-
+      if(prep == null)return;
       //Populate the data and send it to the database:
       for(int i=0; i < cnt; i++) {
         Object fieldValue = _fieldValues.get(i);
@@ -153,6 +159,7 @@ public class RiStdfToWideTables implements RecordVisitor {
           fieldValue = toCsv((Object[])fieldValue);
         prep.setString(i+1, fieldValue.toString());
       }
+      prep.setInt(cnt + 1, _recordCnt);  //TODO insert record count
       if(prep != null){
         prep.addBatch();
         try { prep.executeBatch(); }

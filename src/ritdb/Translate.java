@@ -8,8 +8,9 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.HashMap;
 import java.util.UUID;
+import java.util.function.Supplier;
 
-import rtalk.RtalkConsoleLogger;
+import rtalk.util.RtalkConsoleLogger;
 import rtalk.util.RtalkLoggerInterface;
 // command line stdf to ritdb translator
 public class Translate  implements RtalkLoggerInterface{
@@ -215,6 +216,36 @@ protected static HashMap<String, String> parseArgs(String[] args){
   @Override
   public void log(String message) {
     System.out.println(message);
+  }
+
+  @Override
+  public void logError(String message) {
+    // TODO Auto-generated method stub
+    
+  }
+
+  @Override
+  public void logDebug(String message) {
+    // TODO Auto-generated method stub
+    
+  }
+
+  @Override
+  public void logVerbose(String message) {
+    // TODO Auto-generated method stub
+    
+  }
+
+  @Override
+  public void logError(Exception e) {
+    // TODO Auto-generated method stub
+    
+  }
+
+  @Override
+  public void logVerbose(Supplier msg) {
+    // TODO Auto-generated method stub
+    
   }
 
 

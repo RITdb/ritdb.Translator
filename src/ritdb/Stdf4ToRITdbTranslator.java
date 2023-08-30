@@ -20,6 +20,7 @@ import java.util.Hashtable;
 import java.util.Iterator;
 import java.util.TimeZone;
 import java.util.UUID;
+import java.util.Map.Entry;
 
 import ritdb.stdf4j.Header;
 import ritdb.stdf4j.Record;
@@ -41,6 +42,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	private int entityID = 1; // local runID is 1 first non run is 2
 	private int eventGroup = 0; // set of events from a single touchdown
 	private int eventCount = 0; // total events
+	private int partCount = 0; // PRR counter
 	private boolean inGroup = false; // true if between pirs and prrs, used to
 										// bump eventGrpoup
 	private Connection _sqlConnection = null; // database connection
@@ -50,12 +52,21 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	private String waferIDvalue = null; // value of ID for the current wafer
 	private int[] currentTE = new int[1025]; // entity ID per site for current
 											// test event, between PIR/PRR
+  private String[] _lastPartIdBySite = new String[1025];
+  private boolean inRetest = false; // in a retest group
+  // holding area for part_inst_out pending retest determination
+  private HashMap[] _pendingPios = new HashMap[1025];
+  private int[] _pendingTE = new int[1025];
+  private int[] _pendingFlags = new int[1025];
+  private int _groupSite = 0; // used for counting touchdowns
 	// now a map from the test number in stdf to the entityID of the test
 	private Hashtable<Integer, Integer> testMap = new Hashtable<Integer, Integer>();
 	private int testOrder = 0;  // order of the test
 	// if test indexing is via the name and not the number then we need a name
 	// to entity map
 	private Hashtable<String, Integer> testNameMap = new Hashtable<String, Integer>();
+	// a map from primary test number to number of tests
+	private Hashtable<Integer, Integer> mprNameCount = new Hashtable<Integer, Integer>();
 	// a map from site number to site info eid
 	 private Hashtable<Integer, Integer> siteInfoEid = new Hashtable<Integer, Integer>();
 	// and to support the textTxt field changing from ptr to ptr we need to keep
@@ -79,6 +90,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	private int runID = 0; // entity ID for the run
 	private int waferID = 0; // entity ID for the current wafer
 	private int pinlistID = 0; // entity ID for the current pinlist
+	private int metadataID = 0;
 	private int fileID = 0; // entity ID for the files
 	private int prodID = 0; // entity ID for the product info
 	private int partID = 0; // entity ID for the part info
@@ -99,19 +111,27 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
   private HashSet<Integer> softBinUpdated = new HashSet<Integer>(); // head* 65536 + site * 256 + binNum
   private HashSet<Long> softBinInfoUpdated = new HashSet<Long>();
 	private HashMap<String, String> _guruKeys = null; // all keys
+	private HashMap<String, String> _pendingMetadata = new HashMap<String, String>(); // pending keys
 	private RtalkLoggerInterface _logger;
 	private STDFReader reader;
 	private String _mainTable = "ritdb1";
 	 // for continuation records set to eid. PSR, STR, CDR only
-	private SmCborBuffer[] _contBuffers = null; // record dep order
+	private SmCborBuffer[] _contBuffers = null; // record part_ddep order
 	private int    _continuationEid = 0;  // entity EID being continued
 	private long    _continuationEid2 = 0;  // second entity EID being continued
 	private int    _contTotal = 0; // counter
 	private long _indexTimeRef = 0L;
+  private double _eventTime = 0.0;
 	public boolean _stop = false;
 	private File _srcFile;
 	private boolean _indexRequired;
 	private String _runUUID;
+  private int _totalParts = 0;
+  private int _totalFails = 0;
+  private int _windowTotal = 0;  //total parts in the current window
+  private int _windowFails = 0;
+	private HashMap<String,Object> _atrPending = null;
+	 private HashMap<String,Object> _vurPending = null;
 	
 	// @Override
 	public void afterFile() {
@@ -119,6 +139,10 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 
 	// @Override
 	public void beforeFile() {
+	}
+	
+	public Stdf4ToRITdbTranslator() {
+	  
 	}
 
 	/**
@@ -137,15 +161,62 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		_includeSummaries = includeSummary;
 		_indexRequired = indexRequired;
 		_runUUID = runUUID;
-		addToMetadata("Obsoleted", "false");
-		addToMetadata("ObjClass", "RitdbLog");
-		addToMetadata("ObjFormat", "ritdb");
-		addToMetadata("ObjFormatVer", "8.0");
-    addToMetadata("ritdb.file.RitdbVersion", "ALPHA_P008");
-    addToMetadata("ritdb.file.Usecase", "datalog");
 		if (flags.containsKey("testByName")) _testByNumber = false;
     if (flags.containsKey("obfuscate")) _cleanProp = true;
     if (flags.containsKey("includesSummaries")) _includeSummaries = true;
+	}
+	
+	/**
+	 * insert the default values.  Done after we know the start time
+	 */
+	private void defaultContents(){
+	  UUID uuid = UUID.randomUUID();
+    // create global entities and insert global attributes
+    addToMetadata("Obsoleted", "false");
+    addToMetadata("ObjClass", "RITdb.datalog");
+    addToMetadata("ObjFormat", "ritdb");
+    addToMetadata("ObjFormatVer", "10.0");
+    addToMetadata("ritdb.file.RitdbVersion", "P010");
+    addToMetadata("ritdb.file.Usecase", "RITdb.datalog");
+    insertObject(sequence, runID, 0, "ENTITY_TYPE", "RUN_INFO");
+    insertObject(sequence, runID, 0, "SEQUENCE_REFERENCE", "1970-01-01T00:00:00");
+    insertObject(sequence, fileID, 0, "ENTITY_TYPE", "FILE_INFO");
+    insertObject(sequence, partID, 0, "ENTITY_TYPE", "PART_INFO");
+    insertObject(sequence, prodID, 0, "ENTITY_TYPE", "PRODUCT_CELL_CONFIGURATION");
+    insertObject(sequence, fileID, 1, "CUSTOM_PREFIX", "stdf.");
+    insertObject(sequence, fileID, 2, "CUSTOM_PREFIX", "ri.");
+    insertObject(sequence, fileID, 0, "RITDB_GENERATOR_NAME", "Stdf4ToRITdbTranslator");
+    insertObject(sequence, fileID, 0, "RITDB_GENERATOR_VERSION", "83");
+    insertObject(sequence, fileID, 0, "RITDB_VERSION", "P010");
+    insertObject(sequence, fileID, 0, "IS_TRANSLATED", "TRUE");
+    insertObject(sequence, runID, 0, "RUN_UUID", _runUUID);
+    insertObject(sequence, runID, 0, "RUN_GROUP_UUID", uuid.toString());
+    insertObject(sequence, fileID, 0, "FILE_UUID", UUID.randomUUID().toString());  // ritdb output file 
+    insertObject(sequence, fileID, 1, "SOURCE_FILE", nameHash(fileName));
+    SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
+    insertObject(sequence, fileID, 1, "SOURCE_FILE_DATE", sdf.format(_srcFile.lastModified()));
+    insertObject(sequence, fileID, 1, "SOURCE_FILE_TYPE", "STDFV4");
+    addToMetadata("Title", fileName);
+    
+    // create a result cond entry for pins
+    insertObject(sequence, pinCondID, 0, "ENTITY_TYPE", "RESULT_COND_INFO");
+    insertObject(sequence, pinCondID, 0, "CONDITION_RESOURCE", "DEVICE");
+    insertObject(sequence, pinCondID, 0, "CONDITION_DATA_TYPE", "EID");
+    insertObject(sequence, pinCondID, 0, "CONDITION_TYPE", "PIN");
+    insertObject(sequence, pinCondID, 0, "CONDITION_NAME", "PIN");
+    insertObject(sequence, pinCondID, 0, "CONDITION_ID", "PIN"); //must be unique across entities
+    insertObject(sequence, pinCondID, 0, "CONDITION_LABEL", "PIN");
+    insertObject(sequence, pinCondID, 0, "CONDITION_DESCRIPTION", "PIN");
+    
+    // create a result cond entry for shmoo
+    insertObject(sequence, shmooCondID, 0, "ENTITY_TYPE", "RESULT_COND_INFO");
+    insertObject(sequence, shmooCondID, 0, "CONDITION_RESOURCE", "SHMOO");
+    insertObject(sequence, shmooCondID, 0, "CONDITION_DATA_TYPE", "FLOAT");
+    insertObject(sequence, shmooCondID, 0, "CONDITION_TYPE", "FORCE");
+    insertObject(sequence, shmooCondID, 0, "CONDITION_NAME", "SHMOO");
+    insertObject(sequence, shmooCondID, 0, "CONDITION_ID", "SHMOO");
+    insertObject(sequence, shmooCondID, 0, "CONDITION_LABEL", "SHMOO");
+    insertObject(sequence, shmooCondID, 0, "CONDITION_DESCRIPTION", "SHMOO");
 	}
 	
 	public void start() throws SQLException, FileNotFoundException, IOException, ParseException{
@@ -167,54 +238,21 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		_sqlConnection.setAutoCommit(false);
 		runID = entityID; // run_info  RUN_INFO
 	  fileID = ++entityID; // entity ID for the files  FILE_INFO
-	  prodID = ++entityID; // entity ID for the product info PROGRAM_TEST_CONFIGURATION
+	  prodID = ++entityID; // entity ID for the product info job
 	  partID = ++entityID; // entity ID for the PART_INFO
     pinCondID = ++entityID; // result_cond_info for pin
     shmooCondID = ++entityID; // result_cond_info for shmoo
-		UUID uuid = UUID.randomUUID();
-		// create global entities and insert global attributes
-		insertObject(sequence, runID, 0, "ENTITY_TYPE", "RUN_INFO");
-    insertObject(sequence, runID, 0, "SEQUENCE_REFERENCE", "1990-01-01T00:00:00");
-    insertObject(sequence, fileID, 0, "ENTITY_TYPE", "FILE_INFO");
-    insertObject(sequence, partID, 0, "ENTITY_TYPE", "PART_INFO");
-    insertObject(sequence, prodID, 0, "ENTITY_TYPE", "PROGRAM_TEST_CONFIGURATION");
-    
-    insertObject(sequence, fileID, 0, "RITDB_GENERATOR", "Stdf4ToRITdbTranslator");
-    insertObject(sequence, fileID, 0, "RITDB_GENERATOR_VERSION", "67");
-    insertObject(sequence, fileID, 0, "RITDB_VERSION", "ALPHA_P008");
-    insertObject(sequence, fileID, 0, "IS_TRANSLATED", "Y");
-    insertObject(sequence, runID, 0, "RUN_UUID", _runUUID);
-    insertObject(sequence, runID, 0, "RUN_GROUP_UUID", uuid.toString());
-    
-		insertObject(sequence, fileID, 0, "SOURCE_FILE", nameHash(fileName));
-    insertObject(sequence, fileID, 0, "FILE_UUID", UUID.randomUUID().toString());
-		SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
-    insertObject(sequence, fileID, 0, "SOURCE_FILE_DATE", sdf.format(_srcFile.lastModified()));
-    insertObject(sequence, fileID, 0, "SOURCE_FILE_TYPE", "STDFV4");
-		addToMetadata("Title", fileName);
+    metadataID = ++entityID; // for metadata
 		
-		// create a result cond entry for pins
-    insertObject(sequence, pinCondID, 0, "ENTITY_TYPE", "RESULT_COND_INFO");
-    insertObject(sequence, pinCondID, 0, "CONDITION_RESOURCE", "DEVICE");
-    insertObject(sequence, pinCondID, 0, "CONDITION_DATA_TYPE", "EID");
-    insertObject(sequence, pinCondID, 0, "CONDITION_NAME", "PIN");
-    insertObject(sequence, pinCondID, 0, "CONDITION_ID", "PIN"); //must be unique across entities
-    insertObject(sequence, pinCondID, 0, "CONDITION_LABEL", "PIN");
-    insertObject(sequence, pinCondID, 0, "CONDITION_DESC", "PIN");
-    
-    // create a result cond entry for shmoo
-    insertObject(sequence, shmooCondID, 0, "ENTITY_TYPE", "RESULT_COND_INFO");
-    insertObject(sequence, shmooCondID, 0, "CONDITION_RESOURCE", "SHMOO");
-    insertObject(sequence, shmooCondID, 0, "CONDITION_DATA_TYPE", "FLOAT");
-    insertObject(sequence, shmooCondID, 0, "CONDITION_NAME", "SHMOO");
-    insertObject(sequence, shmooCondID, 0, "CONDITION_ID", "SHMOO");
-    insertObject(sequence, shmooCondID, 0, "CONDITION_LABEL", "SHMOO");
-    insertObject(sequence, shmooCondID, 0, "CONDITION_DESC", "SHMOO");
     
 		reader = new STDFReader(_srcFile, _logger); // note: accepts File,
 												// InputStream or filename
 		reader.parse(this); // as it parses, the reader calls handleRecord
 							          // (below) for each entry
+		// add the metadata
+		insertMetadata();
+    //TODO if atr pending insert it here
+    if(_atrPending != null)insertAtr(_atrPending);
 		_sqlConnection.commit(); // commit all those changes
 		_sqlConnection.setAutoCommit(true);
 
@@ -239,7 +277,9 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     _logger.log("start vacuum");
 		try {
 			_sqlStatement.executeUpdate("VACUUM");
+			// look for a file to use to add values
 			_sqlStatement.close();
+	     RITdbMetadataInserter meta = new RITdbMetadataInserter("datalogAdditions.txt",_sqlConnection);
 		} // restore setting allowing the database to verify writes to the file
 			// system
 		catch (Exception e) {
@@ -446,7 +486,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 				// put testNumber as result_number and result_id
 				insertObject(sequence, entityID, 0, "RESULT_ID", testNumber);
 				// add test_order for use by viewers
-				insertObject(sequence, entityID, 0, "TEST_ORDER", ++testOrder); 
+				insertObject(sequence, entityID, 0, "RESULT_ORDER", ++testOrder); 
 				testEntityId = entityID;
 			}
 			return testEntityId;
@@ -462,7 +502,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 				insertObject(sequence, entityID, 0, "RESULT_NUMBER", testNumber); 
 				insertObject(sequence, entityID, 0, "RESULT_NAME", nameHash(testText)); 
 				insertObject(sequence, entityID, 0, "RESULT_ID", nameHash(testText)); 
-				insertObject(sequence, entityID, 0, "TEST_ORDER", ++testOrder);
+				insertObject(sequence, entityID, 0, "RESULT_ORDER", ++testOrder);
 				return entityID;
 			}
 		}
@@ -481,7 +521,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 			if (testUpdate.get(testEntity).isEmpty()) testTextMap.put(testEntity, new HashMap<Integer,String>()); 
 			if (!testUpdate.get(testEntity).contains(site)) { 
 			    // check to see if there is text
-				insertObject(sequence, testEntity, siteInfoEid.get(site), "RESULT_SITE_TEXT", testText);
+				insertObject(sequence, testEntity, getSite(site), "stdf.RESULT_SITE_TEXT", testText);
 				testUpdate.get(testEntity).add(site);
 				(testTextMap.get(testEntity)).put(site, testText); 
 				// per site test text
@@ -490,7 +530,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		if (!testText.isEmpty()) {// handle changing text
 			if (!((testTextMap.get(testEntity)).get(site)).equalsIgnoreCase(testText)) {
 				int te = currentTE[site]; // per site test event
-				insertObject(sequence, te, testEntity, "RESULT_SITE_TEXT", testText);
+				insertObject(sequence, te, testEntity, "stdf.RESULT_SITE_TEXT", testText);
 			}
 		}
 	}
@@ -508,12 +548,14 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		return df.format(cal.getTime());
 	}
 
+	// have to adjust the time by the local offset to get GMT
 	private String convertUnixTimeStampGMT(long timeSecs) {
 		if (timeSecs == 0) {
 			return null;
 		}
-		if (timeSecs * 1000000L > realSequence) {
-			realSequence = timeSecs * 1000000L;
+		long gmtTimeSecs = (_gmtOffsetMin * 60) + timeSecs;
+		if (gmtTimeSecs * 1000000L > realSequence) {
+			realSequence = gmtTimeSecs * 1000000L;
 		}
 		// create a calendar object and set the time
 		Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
@@ -523,13 +565,29 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		return df.format(cal.getTime());
 	}
 
-	private void addToMetadata(String name, Object value) {
-		if (value != null)
-			_guruKeys.put(name, value.toString());
-		// code for
-		// if(_metadataDef.containsKey(name))
-		// _guruKeys.put(_metadataDef.get(name), value);
-	}
+	/**
+	 * 
+	 * @param name
+	 * @param value
+	 */
+  private void addToMetadata(String name, Object value) {
+    if (value == null) return;
+    // check if empty string and don't insert it
+    String val = value.toString();
+    if (val.trim().isEmpty())return;
+    _guruKeys.put(name, val);
+    _pendingMetadata.put(name, val);
+  }
+  
+  /**
+   * insert any pending metadata and clear the metadata LV
+   */
+  private void insertMetadata(){
+    for (Entry<String, String> entry : _pendingMetadata.entrySet()) {
+      insertObject(0, metadataID, 0, entry.getKey(), entry.getValue());
+    }
+    _pendingMetadata = new HashMap<String, String>();
+  }
 
 	public void handleUnknownRecord(Header header, byte[] bytes) {
 		_logger.log("WARNING: Skipping unknown record type: " + header.getType() + ", " + header.getSubType() + " size "
@@ -568,9 +626,13 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 			String recordType = recordData.getType(); // type of record (Mir,
 														// Ptr etc.)
 			HashMap<String, Object> fields = recordData.getFields();
-			// System.out.println("parsing "+ recordType);
+			 //System.out.println("parsing "+ recordType);
 			if (recordType.equals("Mir")) {
 				this.insertMir(fields);
+        insertObject(sequence, metadataID, 0, "ENTITY_TYPE", "METADATA");
+		    insertMetadata();// insert any pending metadata
+		    inGroup = false;
+		    inRetest = false;
 			}
 			if (recordType.equals("Far")) {
 				this.insertFar(fields);
@@ -642,10 +704,10 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 				this.insertEps(fields);
 			}
 			if (recordType.equals("Atr")) {
-				this.insertAtr(fields);
+			  _atrPending = fields;
 			}
 			if (recordType.equals("Vur")) {
-				this.insertVur(fields);
+        _vurPending = fields;
 			}
 			if (recordType.equals("Psr")) {
 				this.insertPsr(fields);
@@ -686,39 +748,49 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	 * 
 	 */
 	private void insertMir(HashMap<String, Object> fields) {
-	  // start time
+	  // set start time into sequence
+	  convertUnixTimeStampGMT((Long) fields.get("SETUP_T"));
+    convertUnixTimeStampGMT((Long) fields.get("START_T"));	  
+	  // TODO if VUR pending add it here
+    defaultContents();
+	  if(_vurPending != null)insertVur(_vurPending);
+	  // start normal processing
 		long starttime = (Long) fields.get("START_T");
 		if (starttime != 0) {
 			insertObject(starttime, runID, 0, "RUN_START_DTTM_UTC", convertUnixTimeStampGMT(starttime));
-			addToMetadata("ri.test.RUN_START_DTTM_UTC", convertUnixTimeStampGMT(starttime).toString());
+			addToMetadata("ri.sys.StartTimeUTC", convertUnixTimeStampGMT(starttime).toString());
 			insertObject(starttime, runID, 0, "RUN_START_DTTM", convertUnixTimeStamp(starttime));
-			addToMetadata("CreationDate", convertUnixTimeStamp(starttime).toString());
-			addToMetadata("ri.test.RUN_START_DTTM", convertUnixTimeStamp(starttime).toString());
+			addToMetadata("ri.sys.CreationDate", convertUnixTimeStamp(starttime).toString());
+			addToMetadata("ri.sys.StartTime", convertUnixTimeStamp(starttime).toString());
 		}
 		// run
     insertObject(sequence, runID, 0, "RITDB_SOURCE_ID", nameHash(fields.get("NODE_NAM")));
-    insertObject(sequence, runID, 0, "STATION_NUMBER", fields.get("STAT_NUM"));
+    //insertObject(sequence, runID, 0, "STATION_NUMBER", fields.get("STAT_NUM"));
     insertObject(sequence, runID, 0, "CELL_ID", nameHash(fields.get("NODE_NAM")));
     insertObject(sequence, runID, 0, "CELL_NAME", nameHash(fields.get("NODE_NAM")));
     insertObject(sequence, runID, 0, "TEST_FACILITY_ID", nameHash(fields.get("FACIL_ID")));
-    addToMetadata("ri.test.TEST_FACILITY_ID", nameHash(fields.get("FACIL_ID")));
+    addToMetadata("ri.sys.Facility", nameHash(fields.get("FACIL_ID")));
     insertObject(sequence, runID, 0, "TEST_FLOOR_ID", nameHash(fields.get("FLOOR_ID")));
+    addToMetadata("ri.sys.Location", nameHash(fields.get("FLOOR_ID")));
     insertObject(sequence, runID, 0, "LOT_ID", nameHash(fields.get("LOT_ID")));
-    addToMetadata("ri.test.LOT_ID", nameHash(fields.get("LOT_ID")));
-    insertObject(sequence, runID, 0, "STEP_NAME", fields.get("SBLOT_ID"));
-    addToMetadata("ri.test.STEP_NAME", fields.get("SBLOT_ID"));
+    addToMetadata("ri.mes.LotID", nameHash(fields.get("LOT_ID")));
+    insertObject(sequence, runID, 0, "stdf.SUBLOT_ID", fields.get("SBLOT_ID"));
+    addToMetadata("ri.mes.SubLot", fields.get("SBLOT_ID"));
     insertObject(sequence, runID, 0, "PRODUCT_ID", nameHash(fields.get("PART_TYP")));
     insertObject(sequence, partID, 0, "PRODUCT_ID", nameHash(fields.get("PART_TYP")));
     insertObject(sequence, partID, 0, "PART_TYPE", nameHash(fields.get("PART_TYP")));
-    addToMetadata("ri.test.PRODUCT_ID", nameHash(fields.get("PART_TYP")));
+    addToMetadata("ri.mes.DeviceID", nameHash(fields.get("PART_TYP")));
 
-    insertObject(sequence, runID, 0, "JOB_NAME", nameHash(fields.get("JOB_NAM")));
-    addToMetadata("ri.test.JOB_NAME", nameHash(fields.get("JOB_NAM")));
-    insertObject(sequence, runID, 0, "JOB_VERSION", fields.get("JOB_REV"));
-    insertObject(sequence, runID, 0, "FLOW_ID", fields.get("FLOW_ID"));
-    insertObject(sequence, runID, 0, "ENGINEERING_LOT_ID", fields.get("ENG_ID"));
+    insertObject(sequence, prodID, 0, "JOB_NAME", nameHash(fields.get("JOB_NAM")));
+    addToMetadata("ri.mes.JobID", nameHash(fields.get("JOB_NAM")));
+    insertObject(sequence, prodID, 0, "JOB_VERSION", fields.get("JOB_REV"));
+    insertObject(sequence, prodID, 0, "FLOW_ID", fields.get("FLOW_ID"));
+    addToMetadata("ri.mes.Flow", (String)fields.get("FLOW_ID"));
+    insertObject(sequence, runID, 0, "stdf.ENGINEERING_LOT_ID", fields.get("ENG_ID"));
     insertObject(sequence, runID, 0, "TEST_PASS_NAME", fields.get("TEST_COD"));
+    addToMetadata("ri.mes.Step", fields.get("TEST_COD"));
     insertObject(sequence, runID, 0, "RETEST_CODE", fields.get("RTST_COD"));
+    addToMetadata("ri.test.RetestCode", fields.get("RTST_COD"));
     insertObject(sequence, runID, 3, "COMMENT", nameHash(fields.get("USER_TXT")));
     // cell inventory
     entityID++;
@@ -736,38 +808,40 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     insertObject(sequence, entityID, 0, "CELL_INVENTORY_MODE_CODE", fields.get("MODE_COD"));
     insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", nameHash(fields.get("NODE_NAM")));
     insertObject(sequence, entityID, 1, "CELL_SW_CLASS", "TESTER_EXEC");
-    insertObject(sequence, entityID, 1, "CELL_SW_TYPE", fields.get("EXEC_TYP"));
-    insertObject(sequence, entityID, 1, "CELL_SW_VER", fields.get("EXEC_VER"));
+    insertObject(sequence, entityID, 1, "CELL_SW_NAME", fields.get("EXEC_TYP"));
+    insertObject(sequence, entityID, 1, "CELL_SW_TYPE", "CORE");
+    insertObject(sequence, entityID, 1, "CELL_SW_VERSION", fields.get("EXEC_VER"));
 
     addToMetadata("ri.test.TESTER_ID", fields.get("NODE_NAM"));
 
     //insertObject(sequence, equipID, 0, "TESTER_CMD_CODE", fields.get("CMOD_COD"));
     // product and job
+    insertObject(sequence, prodID, 1, "CELL_INVENTORY_EID", cellInventoryID);
     insertObject(sequence, prodID, 0, "PACKAGE_TYPE", fields.get("PKG_TYP"));
     insertObject(sequence, prodID, 0, "PRODUCT_ID", nameHash(fields.get("PART_TYP")));
     insertObject(sequence, prodID, 0, "FAB_PROCESS_ID", fields.get("PROC_ID"));
     insertObject(sequence, prodID, 0, "PRODUCT_FAMILY_ID", nameHash(fields.get("FAMLY_ID")));
-    insertObject(sequence, prodID, 0, "TEST_SETUP", fields.get("SETUP_ID"));
+    insertObject(sequence, prodID, 0, "stdf.TEST_SETUP", fields.get("SETUP_ID"));
     long time = (Long) fields.get("SETUP_T");
     if (time != 0) {
       insertObject(time, prodID, 0, "JOB_SETUP_DTTM_UTC", convertUnixTimeStampGMT(time));
       insertObject(time, prodID, 0, "JOB_SETUP_DTTM", convertUnixTimeStamp(time));
-      insertObject(time, prodID, 0, "PGM_LOAD_MARKER", nameHash(fields.get("NODE_NAM")) + convertUnixTimeStamp(time));
-      insertObject(time, prodID, 0, "LOT_START_MARKER", nameHash(fields.get("NODE_NAM")) + convertUnixTimeStamp(time));
+      insertObject(time, runID, 0, "PGM_LOAD_MARKER", nameHash(fields.get("NODE_NAM")) + convertUnixTimeStamp(time));
+      insertObject(time, runID, 0, "LOT_START_MARKER", nameHash(fields.get("NODE_NAM")) + convertUnixTimeStamp(time));
     }else{
-      insertObject(time, prodID, 0, "PGM_LOAD_MARKER", nameHash(fields.get("NODE_NAM")) + convertUnixTimeStamp(starttime));
-      insertObject(time, prodID, 0, "LOT_START_MARKER", nameHash(fields.get("NODE_NAM")) + convertUnixTimeStamp(starttime));
+      insertObject(time, runID, 0, "PGM_LOAD_MARKER", nameHash(fields.get("NODE_NAM")) + convertUnixTimeStamp(starttime));
+      insertObject(time, runID, 0, "LOT_START_MARKER", nameHash(fields.get("NODE_NAM")) + convertUnixTimeStamp(starttime));
     }
     insertObject(sequence, prodID, 0, "TEST_SPECIFICATION_NAME", nameHash(fields.get("SPEC_NAM"))); 
     insertObject(sequence, prodID, 0, "TEST_SPECIFICATION_VERSION", fields.get("SPEC_VER"));
     insertObject(sequence, prodID, 0, "TEST_TEMPERATURE", fields.get("TST_TEMP"));
     insertObject(sequence, prodID, 0, "AUXILIARY_FILE", fields.get("AUX_FILE"));
-		insertObject(sequence, prodID, 0, "DESIGN_REV", fields.get("DSGN_REV"));
+		insertObject(sequence, prodID, 0, "stdf.DESIGN_REV", fields.get("DSGN_REV"));
 		insertObject(sequence, prodID, 0, "ROM_CODE", fields.get("ROM_COD"));
     insertObject(sequence, prodID, 0, "DATA_PROTECTION_CODE", fields.get("PROT_COD"));
     insertObject(sequence, prodID, 0, "DATE_CODE", fields.get("DATE_COD"));
     // misc
-    //insertObject(sequence, runID, 0, "OPERATOR_ID", fields.get("OPER_NAM"));
+    insertObject(sequence, runID, 0, "stdf.OPER_NAM", fields.get("OPER_NAM"));
     long tmp = (Long) fields.get("BURN_TIM");
     if (tmp != 65535L) {
       insertObject(sequence, runID, 0, "BURNIN_TIME", fields.get("BURN_TIM"));
@@ -776,19 +850,27 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     entityID++;
     currentLimits = entityID;
     insertObject(sequence, currentLimits, 0, "ENTITY_TYPE", "RESULT_LIMIT_SET");
-    insertObject(sequence, currentLimits, 0, "LIMIT_SET_NAME", nameHash(fields.get("SPEC_NAM"))); 
+    String specNam = (String) fields.get("SPEC_NAM");
+    if(specNam == null || specNam.isEmpty() ){
+      insertObject(sequence, currentLimits, 0, "LIMIT_SET_NAME", "default");
+      insertObject(sequence, prodID, 0, "TEST_SPECIFICATION_NAME", "default");
+    }else{
+      insertObject(sequence, currentLimits, 0, "LIMIT_SET_NAME", nameHash(fields.get("SPEC_NAM")));   
+    }
     insertObject(sequence, currentLimits, 0, "LIMIT_SET_TYPE", "PROD");
     // create the worksheet script
     entityID++;
     insertObject(sequence, entityID, 0, "ENTITY_TYPE", "SCRIPT");
-    insertObject(sequence, entityID, 0, "NAME", "worksheet");
-    insertObject(sequence, entityID, 0, "DESCRIPTION", "default view");
+    insertObject(sequence, entityID, 0, "SCRIPT_ID", "worksheet");
+    insertObject(sequence, entityID, 0, "SCRIPT_DESC", "default view");
+    insertObject(sequence, entityID, 0, "SCRIPT_TYPE", "rlinda");
     insertObject(sequence, entityID, 0, "SCRIPT", generateScript((String) fields.get("SPEC_NAM")) );
     // default csv export
     entityID++;
     insertObject(sequence, entityID, 0, "ENTITY_TYPE", "SCRIPT");
-    insertObject(sequence, entityID, 0, "NAME", "csv");
-    insertObject(sequence, entityID, 0, "DESCRIPTION", "default csv view");
+    insertObject(sequence, entityID, 0, "SCRIPT_ID", "csv");
+    insertObject(sequence, entityID, 0, "SCRIPT_DESC", "default csv view");
+    insertObject(sequence, entityID, 0, "SCRIPT_TYPE", "rlinda");
     insertObject(sequence, entityID, 0, "SCRIPT", generateCsvScript((String) fields.get("SPEC_NAM")) );
 	}
 
@@ -800,9 +882,9 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		long time = (Long) fields.get("FINISH_T");
 		if (time != 0L) {
 			insertObject(time, runID, 0, "RUN_END_DTTM", convertUnixTimeStamp(time));
-			addToMetadata("ri.test.RUN_END_DTTM_UTC", convertUnixTimeStampGMT(time).toString());
+			addToMetadata("ri.sys.EndTimeUTC", convertUnixTimeStampGMT(time).toString());
 			insertObject(time, runID, 0, "RUN_END_DTTM_UTC", convertUnixTimeStampGMT(time));
-			addToMetadata("ri.test.RUN_END_DTTM", convertUnixTimeStampGMT(time).toString());
+			addToMetadata("ri.sys.EndTime", convertUnixTimeStampGMT(time).toString());
 		}
 		insertObject(sequence, runID, 0, "LOT_DISPOSITION_CODE", fields.get("DISP_COD"));
 		insertObject(sequence, runID, 1, "COMMENT", fields.get("USR_DESC"));
@@ -819,7 +901,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	      waferID = entityID;
 	      insertObject(sequence, waferID, 0, "ENTITY_TYPE", "SUBSTRATE_EVENT");
 	      insertObject(sequence, runID, 0, "USECASE", "datalog.wafer");
-	       insertObject(sequence, waferID, 0, "SUBSTRATE_INFO_EID", substrateID);
+	      if(substrateID != 0) insertObject(sequence, waferID, 0, "SUBSTRATE_INFO_EID", substrateID);
 	    }
 	    eventGroup = 0;
 	    waferIDvalue = (String) fields.get("SUBSTRATE_ID"); // insert at WRR
@@ -852,7 +934,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
       insertObject(sequence, entityID, 0, "ENTITY_TYPE", "EVENT");
       insertObject(sequence, entityID, 0, "EVENT_TYPE", "WAFER_SUMMARY");
       insertObject(sequence, entityID, 0, "SUBSTRATE_ID", nameHash(waferIDvalue));
-      insertObject(sequence, entityID, 0, "SUBSTRATE_INFO_EID", substrateID);
+      if(substrateID != 0) insertObject(sequence, entityID, 0, "SUBSTRATE_INFO_EID", substrateID);
   		insertObject(sequence, entityID, 0, "TOUCHDOWN_COUNT", eventGroup);
   		Long tmp = (Long) fields.get("PART_CNT");
   		if (tmp != null)
@@ -954,19 +1036,24 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     if (_testByNumber && !testName.containsKey(testNumber)) {
       insertObject(sequence, testNumber, 0, "RESULT_NAME", nameHash(tName));
       testName.put(testNumber, true);
+      // additional mpr names
+      if(mprNameCount.containsKey(testNumber)){
+        for( int i = 1; i < mprNameCount.get(testNumber); i++){
+          insertObject(sequence, testNumber + i, 0, "RESULT_NAME", nameHash(tName) + "_" + i);
+        }
+      }
     }
     insertObject(sequence, testNumber, 0, "TEST_SEQUENCER_NAME", fields.get("SEQ_NAME"));
     if(_includeSummaries){
   		entityID++; // get the next entity ID and do the test synopsis
-      insertObject(sequence, entityID, 0, "ENTITY_TYPE", "EVENT");
-  		insertObject(sequence, entityID, 0, "EVENT_TYPE", "RESULT_SUMMARY");
+      insertObject(sequence, entityID, 0, "ENTITY_TYPE", "stdf.RESULT_SUMMARY");
   		insertObject(sequence, entityID, 0, "RESULT_INFO_EID", testNumber);
   		int head = ((Long) fields.get("HEAD_NUM")).intValue();
   		if (head == 255) {
   			insertObject(sequence, entityID, 0, "SUMMARY_TYPE", "TOTAL");
   		} else {
   			int site = ((Long) fields.get("SITE_NUM")).intValue();
-  	    insertObject(sequence, entityID, 0, "SITE_INFO_EID", siteInfoEid.get(getSite(head,((Long)fields.get("SITE_NUM")).intValue())));
+  	    insertObject(sequence, entityID, 0, "SITE_INFO_EID", getSite(getSite(head,((Long)fields.get("SITE_NUM")).intValue())));
   			insertObject(sequence, entityID, 0, "SUMMARY_TYPE", "SITE");
   		}
   		int opt;
@@ -1025,14 +1112,11 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
   			} else if (fieldName.equals("TEST_NUM")) {
   				newName = "TEST_ID";
   				insertObject(sequence, entityID, 0, newName, fieldValue);
-  			} else if (fieldName.equals("SEQ_NAME")) {
-  				newName = "TEST_SEQUENCER_NAME";
-  				insertObject(sequence, entityID, 0, newName, fieldValue);
   			} else if (fieldName.equals("TEST_LBL")) {
   				newName = "RESULT_LABEL";
   				insertObject(sequence, entityID, 0, newName, fieldValue);
   			} else if (fieldName.equals("TEST_TYP")) {
-  				newName = "TEST_TYPE";
+  				newName = "RESULT_TYPE";
   				insertObject(sequence, entityID, 0, newName, fieldValue);
   			}
   		}
@@ -1046,21 +1130,24 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	private void insertPir(HashMap<String, Object> fields) {
 		int site = getSite(((Long) fields.get("HEAD_NUM")).intValue(),
 		    ((Long) fields.get("SITE_NUM")).intValue()  );
+    if(site == 255) return; 
 		entityID++;// start a new testEvent
 		currentTE[site] = entityID;
 		if(eventGroup == 0 && waferID == 0){
 	    insertObject(sequence, runID, 0, "USECASE", "datalog.unit");
 		}
-		if (!inGroup) {
-			inGroup = true;
-			eventGroup++;
-			dtrID = entityID;
+		if(_groupSite == 0) _groupSite = site;
+		if(_groupSite == site){
+		  inGroup = true;
+      eventGroup++;
+      dtrID = entityID;
 		}
 		insertObject(sequence, entityID, 0, "ENTITY_TYPE", "PART_RESULT_EVENT");
 		insertObject(sequence, entityID, 0, "PART_RESULT_EVENT_GROUP", eventGroup);
     insertObject(sequence, entityID, 0, "PART_INFO_EID", partID);
 		insertObject(sequence, entityID, 0, "PART_RESULT_EVENT_ORDER", ++eventCount);
-		insertObject(sequence, entityID, 0, "SITE_INFO_EID", siteInfoEid.get(site));
+
+		insertObject(sequence, entityID, 0, "SITE_INFO_EID", getSite(site));
     insertObject(sequence, entityID, 0, "PROGRAM_TEST_CONFIG_EID", prodID);
 		if (waferID != 0) {
 			insertObject(sequence, entityID, 0, "SUBSTRATE_EVENT_EID", waferID);
@@ -1072,79 +1159,133 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	  * @param fields
 	  */
 	private void insertPrr(HashMap<String, Object> fields) {
-    int site = getSite(((Long) fields.get("HEAD_NUM")).intValue(),
-        ((Long) fields.get("SITE_NUM")).intValue()  );
-		// MAKE A PIO AND PII
-		entityID++;
-		int pio = entityID;
-    insertObject(sequence, pio, 0, "ENTITY_TYPE", "PART_INSTANCE_OUT");
-    if(waferID != 0)insertObject(sequence, pio, 0, "SUBSTRATE_EVENT_EID", waferID);
-		int te = currentTE[site];
-		if (inGroup) {
-			inGroup = false;
-			if ((fields.get("TEST_T") != null) && ((Long) fields.get("TEST_T") != 0L)) {
-				Long timeSecs = (Long) fields.get("TEST_T") * 100L; // millis to
-																	// 10us
-				realSequence = (timeSecs) + realSequence;
-				insertObject(sequence, te, 0, "EVENT_TEST_TIME", ((double) timeSecs / 100000.0)); 
-				// convert 19us steps to double seconds
-			}
-		}
-		insertObject(sequence, te, 0, "RESULT_LIMIT_SET_EID", currentLimits);
-		insertObject(sequence, te, 1, "BIN_EID", getHardbinEid((Long)fields.get("HARD_BIN")));
-		// index = 0
-		insertObject(sequence, pio, 0, "DISPOSITION_BIN_EID", getHardbinEid((Long)fields.get("HARD_BIN")));
-		insertObject(sequence, pio, 1, "BIN_EID", getHardbinEid((Long)fields.get("HARD_BIN")));
-    long tmpL = ((Long) fields.get("SOFT_BIN"));
-    if (tmpL != 65535L) {
-      insertObject(sequence, te, 2, "BIN_EID", getSoftbinEid(tmpL));   // index = 1
-      insertObject(sequence, pio, 2, "BIN_EID", getSoftbinEid(tmpL));   // index = 1
+    int site=getSite(((Long)fields.get("HEAD_NUM")).intValue(), ((Long)fields.get("SITE_NUM")).intValue());
+    if(site == 255) return; 
+    entityID++;
+    int te=currentTE[site];
+    if (inGroup) {// advances test time
+      inGroup = false;
+      if ((fields.get("TEST_T") != null) && ((Long)fields.get("TEST_T") != 0L)) {
+        Long timeSecs=(Long)fields.get("TEST_T") * 1000L; // millis to uS
+        realSequence=(timeSecs) + realSequence;
+        insertObject(sequence, te, 0, "EVENT_TEST_TIME", ((double)timeSecs / 1000000.0));
+        _eventTime = (double)timeSecs / 1000000.0;
+        // convert 1us steps to double seconds
+      }
     }
-		int tmp = ((Integer) fields.get("X_COORD"));
-		if (tmp != -32768) {
-			insertObject(sequence, pio, 0, "PART_X", tmp);
-		}
-		tmp = ((Integer) fields.get("Y_COORD"));
-		if (tmp != -32768) {
-			insertObject(sequence, pio, 0, "PART_Y", tmp);
-		}
-		insertObject(sequence, te, 0, "NUM_TESTS", fields.get("NUM_TEST"));
-		
-		String partId = ((String) fields.get("PART_ID"));
-		if(partId != null){
-			String[] partIdSplit = partId.split(":");
-			insertObject(sequence, te, 0, "PART_ID", partIdSplit[0]);
-	     insertObject(sequence, pio, 0, "PART_ID", partIdSplit[0]);
-       insertObject(sequence, pio, 0, "PART_ID_OUT", partIdSplit[0]);
-		}
+    insertObject(sequence, te, 0, "RESULT_LIMIT_SET_EID", currentLimits);
+    insertObject(sequence, te, 1, "BIN_EID", getHardbinEid((Long)fields.get("HARD_BIN")));
+    // index = 0
+    long tmpL=((Long)fields.get("SOFT_BIN"));
+    if (tmpL != 65535L) {
+      insertObject(sequence, te, 2, "BIN_EID", getSoftbinEid(tmpL)); // index = 2
+    }
+    insertObject(sequence, te, 0, "NUM_TESTS", fields.get("NUM_TEST"));
 
-		String partTxt = ((String) fields.get("PART_TXT"));
-		if(partTxt != null){
-			String[] partTxtSplit = partTxt.split(":");
-			insertObject(sequence, te, 0, "PART_TEXT", partTxtSplit[0]);
-			if(partTxtSplit.length == 2){
-			  insertObject(sequence, te, 0, "ECID", partTxtSplit[1]);			
-	      insertObject(sequence, pio, 0, "ECID", partTxtSplit[1]);
-			}
-		}
-		
-		int flags = ((Byte) fields.get("PART_FLG")).intValue();
-		if ((flags & 0x18) == 0x08) {
-			insertObject(sequence, te, 0, "PF", "FAIL", "F");
-		}
-		if ((flags & 0x18) == 0x0) {
-			insertObject(sequence, te, 0, "PF", "PASS", "P");
-		}
-		if ((flags & 0x14) == 0x10) {
-			insertObject(sequence, te, 0, "PF", "TESTED", "T");
-		}
-		if ((flags & 0x04) == 0x04) {
-			insertObject(sequence, te, 0, "PF", "ABORT", "A");
-		}
-		if ((flags & 0x03) != 0x0) {
-			insertObject(sequence, te, 0, "RETEST_CODE", "RETEST", "R");
-		}
-	}
+    String partId=((String)fields.get("PART_ID"));
+    if (partId != null) {
+      String[] partIdSplit=partId.split(":");
+      insertObject(sequence, te, 0, "PART_ID", partIdSplit[0]);
+    }
+
+    String partTxt=((String)fields.get("PART_TXT"));
+    if (partTxt != null) {
+      String[] partTxtSplit=partTxt.split(":");
+      insertObject(sequence, te, 0, "PART_TEXT", partTxtSplit[0]);
+      if (partTxtSplit.length == 2) {
+        insertObject(sequence, te, 0, "ECID", partTxtSplit[1]);
+      }
+    }
+    int flags=((Byte)fields.get("PART_FLG")).intValue();
+    if ((flags & 0x18) == 0x08) {
+      insertObject(sequence, te, 0, "PF", "FAIL", "F");
+    }
+    if ((flags & 0x18) == 0x0) {
+      insertObject(sequence, te, 0, "PF", "PASS", "P");
+    }
+    if ((flags & 0x14) == 0x10) {
+      insertObject(sequence, te, 0, "PF", "TESTED", "T");
+    }
+    if ((flags & 0x04) == 0x04) {
+      insertObject(sequence, te, 0, "PF", "ABORT", "FA");
+    }
+    if ((flags & 0x03) != 0x0) {
+      //insertObject(sequence, te, 0, "RETEST_CODE", "RETEST", "R");
+    }
+    // now check if we should emit pending PIOs
+
+    inRetest = _lastPartIdBySite[site] != null && _lastPartIdBySite[site].equals(partId);
+    if(!inRetest) _pendingFlags[site] = flags;
+    if(_pendingPios[site] != null ){
+      if(!inRetest){
+        insertPio(_pendingPios[site],_pendingTE[site], _pendingFlags[site] );
+        _pendingPios[site] = null;
+      }
+    }
+    // replace pending pio
+    _pendingPios[site] = fields;
+    _pendingTE[site] = te;
+    _lastPartIdBySite[site] = partId;
+
+  }
+	
+	 // we know this is the final result after retests so insert the PIO
+  private void insertPio(HashMap<String, Object> fields, int testEvent, int partFlags) {
+    int site=getSite(((Long)fields.get("HEAD_NUM")).intValue(), ((Long)fields.get("SITE_NUM")).intValue());
+    // add to pending
+    entityID++;
+    int pio=entityID;
+    insertObject(sequence, pio, 0, "ENTITY_TYPE", "PART_INSTANCE_OUT");
+    insertObject(sequence, pio, 0, "PART_RESULT_EVENT_EID", testEvent);
+    if ((partFlags & 0x18) == 0x08) insertObject(sequence, pio, 0, "RETEST_CODE", "F");
+    if ((partFlags  & 0x04) == 0x04) insertObject(sequence, pio, 0, "RETEST_CODE", "A");
+    
+    if (waferID != 0) insertObject(sequence, pio, 0, "SUBSTRATE_EVENT_EID", waferID);
+    insertObject(sequence, pio, 0, "DISPOSITION_BIN_EID", getHardbinEid((Long)fields.get("HARD_BIN")));
+    insertObject(sequence, pio, 1, "BIN_EID", getHardbinEid((Long)fields.get("HARD_BIN")));
+    byte[] fix = (byte[])fields.get("PART_FIX");
+    if(fix != null && fix.length != 0){
+      SmCborBuffer buf = new SmCborBuffer();
+      buf.put(fix);
+      insertObject(sequence, pio, 1, "stdf.PART_FIX", buf.toBytes());
+    }
+    long tmpL=((Long)fields.get("SOFT_BIN"));
+    if (tmpL != 65535L) {
+      insertObject(sequence, pio, 2, "BIN_EID", getSoftbinEid(tmpL)); // index = 1
+    }
+    int tmp=((Integer)fields.get("X_COORD"));
+    if (tmp != -32768) {
+      insertObject(sequence, pio, 0, "PART_X", tmp);
+    }
+    tmp=((Integer)fields.get("Y_COORD"));
+    if (tmp != -32768) {
+      insertObject(sequence, pio, 0, "PART_Y", tmp);
+    }
+    String partId=((String)fields.get("PART_ID"));
+    if (partId != null) {
+      String[] partIdSplit=partId.split(":");
+      insertObject(sequence, pio, 0, "PART_ID", partIdSplit[0]);
+      insertObject(sequence, pio, 0, "PART_ID_OUT", partIdSplit[0]);
+    }
+    String partTxt=((String)fields.get("PART_TXT"));
+    if (partTxt != null) {
+      String[] partTxtSplit=partTxt.split(":");
+      if (partTxtSplit.length == 2) {
+        insertObject(sequence, pio, 0, "ECID", partTxtSplit[1]);
+      }
+    }
+    _totalParts++;  // advance the part counters
+    _windowTotal++;
+    int flags=((Byte)fields.get("PART_FLG")).intValue();
+    if ((flags & 0x18) == 0x08) {
+      _totalFails++;
+      _windowFails++;
+    }
+    if ((flags & 0x04) == 0x04) {
+      _totalFails++;
+      _windowFails++;
+    }
+  }
 
 	private void insertPtr(HashMap<String, Object> fields) {
     int site = getSite(((Long) fields.get("HEAD_NUM")).intValue(),
@@ -1154,7 +1295,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		Integer testNumber = getTestEntityFor(tmp1, (String) fields.get("TEST_TXT"));
 		if (!testUpdate.containsKey(testNumber)) {
 			testUpdate.put(testNumber, new HashSet<Integer>());
-			insertObject(sequence, testNumber, 0, "RESULT_DISTRIBUTION_TYPE", "CONTINUOUS");
+			insertObject(sequence, testNumber, 0, "RESULT_DISTRIBUTION_TYPE", "continuous");
 	    insertObject(sequence, testNumber, 0, "ANALYZABLE", "Y");
 	    insertObject(sequence, testNumber, 0, "RESULT_DATA_TYPE", "FLOAT");
 			Byte opt = (Byte) fields.get("OPT_FLAG");
@@ -1216,13 +1357,13 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 			result = ((Number) fields.get("RESULT")).doubleValue();
 			// tested but no pass/fail
 			if ((flags & 0x40) == 0x40)
-				insertObject(sequence, te, testNumber, "R", result, "T");
+				insertObject(sequence, te, testNumber, "R", result, "XV");
 			// passed
 			if ((flags & 0xc0) == 0x0)
-				insertObject(sequence, te, testNumber, "R", result, "P");
+				insertObject(sequence, te, testNumber, "R", result, "PV");
 			// failed
 			if ((flags & 0xc0) == 0x80)
-				insertObject(sequence, te, testNumber, "R", result, "F");
+				insertObject(sequence, te, testNumber, "R", result, "FV");
 		} else { // no result no pass fail not executed
 			//TODO insertObject(sequence, te, testNumber, "R", null, "X");
 		}
@@ -1232,6 +1373,12 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	}
 
 	private void insertPcr(HashMap<String, Object> fields) {
+	  for(int i = 0 ; i < _pendingPios.length; i++){
+	    if(_pendingPios[i] != null){
+	      insertPio(_pendingPios[i], _pendingTE[i],_pendingFlags[i]);
+	      _pendingPios[i] = null;
+	    }
+	  }
 	  Long head = (Long) fields.get("HEAD_NUM");
     Long tmp;
 	  if(_includeSummaries){
@@ -1259,22 +1406,22 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 			}
 		}
 		if (head != 255L) {
-	    insertObject(sequence, entityID, 0, "SITE_INFO_EID", siteInfoEid.get(getSite(head.intValue(),((Long)fields.get("SITE_NUM")).intValue())));
+	    insertObject(sequence, entityID, 0, "SITE_INFO_EID", getSite(getSite(head.intValue(),((Long)fields.get("SITE_NUM")).intValue())));
 			insertObject(sequence, entityID, 0, "SUMMARY_TYPE", "SITE");
 		} else {
 			insertObject(sequence, entityID, 0, "SUMMARY_TYPE", "TOTAL");
 	    insertObject(sequence, entityID, 0, "TOUCHDOWN_COUNT", eventGroup);
 	    insertObject(sequence, runID, 0, "MIN_PART", "1");
-	    addToMetadata("ri.test.MIN_PART", "1");
+	    addToMetadata("ri.mes.MinPart", "1");
 	    insertObject(sequence, runID, 0, "MAX_PART", fields.get("PART_CNT").toString());
-	    addToMetadata("ri.test.MAX_PART", fields.get("PART_CNT").toString());
+	    addToMetadata("ri.mes.MaxPart", fields.get("PART_CNT").toString());
       Long total = (Long) fields.get("PART_CNT");
       if (total > 0) {
         insertObject(sequence, runID, 0, "PART_COUNT", fields.get("PART_CNT"));
-        addToMetadata("ri.test.PART_COUNT", fields.get("PART_CNT").toString());
+        addToMetadata("ri.mes.PartCount", fields.get("PART_CNT").toString());
         Long yield = (tmp * 100L) / total;
         insertObject(sequence, runID, 0, "YIELD", yield.intValue());
-        addToMetadata("ri.test.YIELD", yield.toString());
+        addToMetadata("ri.mes.YIELD", yield.toString());
       }
 		}
 		tmp = (Long) fields.get("FUNC_CNT");
@@ -1284,20 +1431,19 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	  }else{
 	    if (head == 255L) {
 	      insertObject(sequence, runID, 0, "MIN_PART", "1");
-	      addToMetadata("ri.test.MIN_PART", "1");
+	      addToMetadata("ri.mes.MinPart", "1");
 	      insertObject(sequence, runID, 0, "MAX_PART", fields.get("PART_CNT").toString());
-	      addToMetadata("ri.test.MAX_PART", fields.get("PART_CNT").toString());
+	      addToMetadata("ri.mes.MaxPart", fields.get("PART_CNT").toString());
 	      Long total = (Long) fields.get("PART_CNT");
 	      tmp = (Long) fields.get("GOOD_CNT");
 	      if (total > 0 && tmp != null) {
 	        insertObject(sequence, runID, 0, "PART_COUNT", fields.get("PART_CNT"));
-	        addToMetadata("ri.test.PART_COUNT", fields.get("PART_CNT").toString());
+	        addToMetadata("ri.mes.TotalCount", fields.get("PART_CNT").toString());
 	        Long yield = (tmp * 100L) / total;
 	        insertObject(sequence, runID, 0, "YIELD", yield.intValue());
-	        addToMetadata("ri.test.YIELD", yield.toString());
+	        addToMetadata("ri.mes.TotalYield", yield.toString());
 	      }
 	    }
-	    
 	  }
 	}
 
@@ -1364,7 +1510,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	private void insertSdr(HashMap<String, Object> fields) {
     insertObject(sequence, cellInventoryID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
     insertObject(sequence, ++cellInventoryID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
-	  if(fields.get("HAND_TYP") != null){
+	  if(fields.get("HAND_TYP") != null && !((String)fields.get("HAND_TYP")).isEmpty()){
 	    entityID++;
 	    insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
 	    insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "HANDLER");
@@ -1379,7 +1525,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	      insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("MANUAL")); 
 	      insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
 	  }
-	   if(fields.get("LASR_TYP") != null){
+	  if(fields.get("LASR_TYP") != null && !((String)fields.get("LASR_TYP")).isEmpty()){
 	      entityID++;
 	      insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
 	      insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "LASER");
@@ -1387,45 +1533,49 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 	      insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("LASR_ID"));
 	       insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
 	    }
+	   if(fields.get("EXTR_TYP") != null && !((String)fields.get("EXTR_TYP")).isEmpty()){
+       entityID++;
+       insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
+       insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "stdf.EXTRA");
+       insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("EXTR_TYP"));
+       insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("EXTR_ID"));
+        insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
+     }
 		
     insertObject(sequence, prodID, 0, "SITE_COUNT", fields.get("SITE_CNT"));  
     // generate a hardware group and children entity for each site group 
     int hwCnt = 1;
-    boolean inserted = false;
-    entityID++; 
-    inserted = inserted | insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("LOAD_TYP"));
-    inserted = inserted | insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("LOAD_ID"));
-    if(inserted){
-       insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
-       insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "LOADBOARD");
-       insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
+    if(fields.get("LOAD_TYP") != null && !(((String)fields.get("LOAD_TYP")).isEmpty() && ((String)fields.get("LOAD_ID")).isEmpty())){
+      entityID++; 
+      insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("LOAD_TYP"));
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("LOAD_ID"));
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "LOADBOARD");
+      insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
     }
-    inserted = false;
-    entityID++; 
-    inserted = inserted | insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("DIB_TYP"));
-    inserted = inserted | insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("DIB_ID"));
-    if(inserted){
-       insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
-       insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "DIB");
-       insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
+    if(fields.get("DIB_TYP") != null && !(((String)fields.get("DIB_TYP")).isEmpty() && ((String)fields.get("DIB_ID")).isEmpty())){
+      entityID++; 
+      insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("DIB_TYP"));
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("DIB_ID"));
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "DIB");
+      insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
     }
-    inserted = false;
-    entityID++; 
-    inserted = inserted | insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("CONT_TYP"));
-    inserted = inserted | insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("CONT_ID"));
-    if(inserted){
-       insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
-       insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "SOCKET");
-       insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
+    if(fields.get("CONT_TYP") != null && !(((String)fields.get("CONT_TYP")).isEmpty() && ((String)fields.get("CONT_ID")).isEmpty())){
+      entityID++; 
+      insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("CONT_TYP"));
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("CONT_ID"));
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "SOCKET");
+      insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
     }
-    inserted = false;
-    entityID++; 
-    inserted = inserted | insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("CARD_TYP"));
-    inserted = inserted | insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("CARD_ID"));
-    if(inserted){
-       insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
-       insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "CIB");
-       insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
+    if(fields.get("CARD_TYP") != null && !(((String)fields.get("CARD_TYP")).isEmpty() && ((String)fields.get("CARD_ID")).isEmpty())){
+      entityID++; 
+      insertObject(sequence, entityID, 0, "ENTITY_TYPE", "CELL_INVENTORY");
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_TYPE", fields.get("CARD_TYP"));
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_ID", fields.get("CARD_ID"));
+      insertObject(sequence, entityID, 0, "CELL_INVENTORY_CLASS", "CIB");
+      insertObject(sequence, entityID, 0, "SITE_GROUP", fields.get("SITE_GRP"));
     }
        
    // for each site in this group create a Site_Info
@@ -1439,7 +1589,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
   	    insertObject(sequence, siteEid, 0, "SITE_ID", list[i]);
   	    insertObject(sequence, siteEid, 0, "PHYSICAL_SITE_NUMBER", list[i]);
   	    insertObject(sequence, siteEid, 0, "SITE_GROUP", fields.get("SITE_GRP"));
-  	    insertObject(sequence, siteEid, 0, "ACTIVE_SITE", "Y");
+  	    insertObject(sequence, siteEid, 0, "ACTIVE_SITE", "T");
   	   }
 		}
 	}
@@ -1454,7 +1604,15 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
   		if(fields.get("HBIN_NAM") == null){
   		  insertObject(sequence, binEid, 0, "BIN_NAME", "BIN" + String.format("%1$" + 3 + "s", bin).replace(' ', '0'));
   		}
-  		insertObject(sequence, binEid, 0, "BIN_PF", fields.get("HBIN_PF"));
+  		String binPf = (String) fields.get("HBIN_PF");
+  		if(binPf == null){
+  		  insertObject(sequence, binEid, 0, "BIN_PF", "UNKNOWN");
+  		}else{
+        if(binPf.equals("P")) insertObject(sequence, binEid, 0, "BIN_PF", "PASS");
+        else if(binPf.equals("F")) insertObject(sequence, binEid, 0, "BIN_PF", "FAIL");
+        else insertObject(sequence, binEid, 0, "BIN_PF", "UNKNOWN");		  
+  		}
+
     // now the summary
   		if(_includeSummaries){
         entityID++;
@@ -1463,7 +1621,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
         insertObject(sequence, entityID, 0, "BIN_EID", binEid);
         insertObject(sequence, entityID, 0, "BIN_COUNT", fields.get("HBIN_CNT"));
         if (head != 255L) {
-          insertObject(sequence, entityID, 0, "SITE_INFO_EID", siteInfoEid.get(getSite(head.intValue(),
+          insertObject(sequence, entityID, 0, "SITE_INFO_EID", getSite(getSite(head.intValue(),
                                                               ((Long)fields.get("SITE_NUM")).intValue())));
           insertObject(sequence, entityID, 0, "SUMMARY_TYPE", "SITE");
         }else{
@@ -1496,12 +1654,19 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     if(!softBinInfoUpdated.contains(binNum)){
       softBinInfoUpdated.add(binNum);
       insertObject(sequence, binEid, 0, "BIN_NAME", fields.get("SBIN_NAM"));
-      insertObject(sequence, binEid, 0, "BIN_PF", fields.get("SBIN_PF"));	
+      String binPf = (String) fields.get("SBIN_PF");
+      if(binPf == null){
+        insertObject(sequence, binEid, 0, "BIN_PF", "UNKNOWN");
+      }else{
+        if(binPf.equals("P")) insertObject(sequence, binEid, 0, "BIN_PF", "PASS");
+        else if(binPf.equals("F")) insertObject(sequence, binEid, 0, "BIN_PF", "FAIL");
+        else insertObject(sequence, binEid, 0, "BIN_PF", "UNKNOWN");   
+      }
       if(fields.get("SBIN_NAM") == null){
         insertObject(sequence, binEid, 0, "BIN_NAME", "BIN" + String.format("%1$" + 3 + "s", bin).replace(' ', '0'));
       }
     }
-		int binUpdate = Math.toIntExact((head * 65536 + siteNum * 256 + binNum));
+		int binUpdate = (int) ((head * 65536 + siteNum * 256 + binNum));
 		if(!softBinUpdated.contains(binUpdate)){
 		  softBinUpdated.add(binUpdate);
 		// now the summary
@@ -1512,7 +1677,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
         insertObject(sequence, entityID, 0, "BIN_EID", binEid);
         insertObject(sequence, entityID, 0, "BIN_COUNT", fields.get("SBIN_CNT"));
         if (head != 255L) {
-          insertObject(sequence, entityID, 0, "SITE_INFO_EID", siteInfoEid.get(getSite(head.intValue(), siteNum.intValue())));
+          insertObject(sequence, entityID, 0, "SITE_INFO_EID", getSite(getSite(head.intValue(), siteNum.intValue())));
           insertObject(sequence, entityID, 0, "SUMMARY_TYPE", "SITE");
         }else{
           insertObject(sequence, entityID, 0, "SUMMARY_TYPE", "TOTAL");
@@ -1567,11 +1732,13 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 
 	private void insertPmr(HashMap<String, Object> fields) {
 		entityID++;// start a new entity
-    int site = getSite(((Long) fields.get("HEAD_NUM")).intValue(),
-        ((Long) fields.get("SITE_NUM")).intValue());
+		if(fields.get("HEAD_NUM") != null && fields.get("SITE_NUM") != null){
+	    int site = getSite(((Long) fields.get("HEAD_NUM")).intValue(),
+	        ((Long) fields.get("SITE_NUM")).intValue());
+	    insertObject(sequence, entityID, 0, "SITE_INFO_EID", getSite(site));
+		}
     pmrIndex.put(((Long) fields.get("PMR_INDX")).intValue(), entityID);
 		insertObject(sequence, entityID, 0, "ENTITY_TYPE", "PIN_INFO");
-    insertObject(sequence, entityID, 0, "SITE_INFO_EID", siteInfoEid.get(site));
 		insertObject(sequence, entityID, 0, "CHANNEL_NAME", fields.get("CHAN_NAM"));
 		insertObject(sequence, entityID, 0, "PIN_ID", fields.get("PHY_NAM"));
 		insertObject(sequence, entityID, 0, "PMR_INDEX", fields.get("PMR_INDX"));
@@ -1627,8 +1794,8 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 			if (opt != null) {
 				if ((opt & 0x02) == 0) { // insert smhoo info
 				  shmoo = true;
-				  shmooValue = (Double) fields.get("START_IN");
-				  shmooInc = (Double) fields.get("INCR_IN");
+				  shmooValue = ((Float) fields.get("START_IN")).doubleValue();
+				  shmooInc = ((Float) fields.get("INCR_IN")).doubleValue();
 					//insertObject(sequence, primaryTestEid, 0, "START_IN", fields.get("START_IN"));
 					//insertObject(sequence, primaryTestEid, 0, "INCR_IN", fields.get("INCR_IN"));
 				}
@@ -1638,6 +1805,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 			for (int j = 0; j < count; j++) {
 				if (j == 0) {
 					subtest = primaryTestEid;
+					mprNameCount.put(primaryTestEid, count);
 				} else {
 					entityID++;// start a new entity
 					subtest = entityID;
@@ -1655,11 +1823,12 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
         }else{
           insertObject(sequence, subtest, pinCondID, "RESULT_COND_RANGE_VALUE", pmrIndex.get(((Long)list[j]).intValue()));
         }
-        insertObject(sequence, subtest, 0, "TEST_ORDER", ++testOrder);
+        insertObject(sequence, subtest, 0, "RESULT_ORDER", ++testOrder);
         insertObject(sequence, subtest, 0, "RESULT_COND_RANGE_INDEX", j + 1);
+        insertObject(sequence, subtest, 0, "SUBTEST", j + 1);
 				insertObject(sequence, subtest, 0, "RESULT_UNITS", fields.get("UNITS"));
 				insertObject(sequence, subtest, 0, "UNITS_IN", fields.get("UNITS_IN"));
-	      insertObject(sequence, subtest, 0, "RESULT_DISTRIBUTION_TYPE", "CONTINUOUS");
+	      insertObject(sequence, subtest, 0, "RESULT_DISTRIBUTION_TYPE", "continuous");
 	      insertObject(sequence, subtest, 0, "ANALYZABLE", "Y");
 	      insertObject(sequence, subtest, 0, "RESULT_DATA_TYPE", "FLOAT");
 	      if (opt == null) {
@@ -1705,17 +1874,17 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		Byte parm = ((Byte) fields.get("PARM_FLG")); // can use for high low
 														// fail
 		int flags = ((Byte) fields.get("TEST_FLG")).intValue();
-		String pf = "P";
+		String pf = "PV";
 		if ((flags & 0xC0) == 0x80) {
 			insertObject(sequence, te, primaryTestEid, "CALC_TEST_FLAG", flags & 0xff);
-			pf = "F";
+			pf = "FV";
 		}
 		if ((flags & 0x20) == 0x20)
-			pf = "A";
+			pf = "FA";
 		if ((flags & 0x50) == 0x50)
 			pf = "X";
 		if ((flags & 0x7a) == 0x40)
-			pf = "T";
+			pf = "TV";
 		if ((flags & 0xa0) == 0xa0)
 			pf = "FA";
 
@@ -1727,7 +1896,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 //		}
 		int count = ((Number) fields.get("RSLT_CNT")).intValue();
 		int statcount = ((Number) fields.get("RTN_ICNT")).intValue();
-		String flag = "P";
+		String flag = "PV";
 		if (statcount == count && count > 0) {
 			Object[] list = (Object[]) fields.get("RTN_RSLT");
 			Object[] state = (Object[]) fields.get("RTN_STAT");
@@ -1736,37 +1905,37 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 				int binVal = (bin == null) ? 4 : bin.intValue();
 				switch (binVal) {
 				case 0:
-					flag = "PL";
+					flag = "PV";
 					break;
 				case 1:
-					flag = "PH";
+					flag = "PV";
 					break;
 				case 2:
-					flag = "PM";
+					flag = "PV";
 					break;
 				case 3:
-					flag = "PG";
+					flag = "PV";
 					break;
 				case 4:
 					flag = "TX";
 					break;
 				case 5:
-					flag = "FL";
+					flag = "FV";
 					break;
 				case 6:
-					flag = "FH";
+					flag = "FV";
 					break;
 				case 7:
-					flag = "FM";
+					flag = "FV";
 					break;
 				case 8:
-					flag = "FG";
+					flag = "FV";
 					break;
 				case 9:
-					flag = "TO";
+					flag = "XV";
 					break;
 				case 10:
-					flag = "TS";
+					flag = "XV";
 					break;
 				}
 				insertObject(sequence, te, primaryTestEid, "R", list[0], pf);
@@ -1776,37 +1945,37 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 					int binVal = (bin == null) ? 4 : bin.intValue();
 					switch (binVal) {
 					case 0:
-						flag = "PL";
+						flag = "PV";
 						break;
 					case 1:
-						flag = "PH";
+						flag = "PV";
 						break;
 					case 2:
-						flag = "PM";
+						flag = "PV";
 						break;
 					case 3:
-						flag = "PG";
+						flag = "PV";
 						break;
 					case 4:
 						flag = "TX";
 						break;
 					case 5:
-						flag = "FL";
+						flag = "FV";
 						break;
 					case 6:
-						flag = "FH";
+						flag = "FV";
 						break;
 					case 7:
-						flag = "FM";
+						flag = "FV";
 						break;
 					case 8:
-						flag = "FG";
+						flag = "FV";
 						break;
 					case 9:
-						flag = "TO";
+						flag = "XV";
 						break;
 					case 10:
-						flag = "TS";
+						flag = "XV";
 						break;
 					}
 					insertObject(sequence, te, (primaryTestEid + i), "R", list[i], flag); 
@@ -1837,7 +2006,8 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		// now update the testText
 		updateTextText(primaryTestEid, site, (String) fields.get("TEST_TXT"));
 	}
-
+	
+  
 	private void insertFtr(HashMap<String, Object> fields) {
     int site = getSite(((Long) fields.get("HEAD_NUM")).intValue(),
         ((Long) fields.get("SITE_NUM")).intValue()  );
@@ -1845,7 +2015,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		Integer tmp1 = ((Long) fields.get("TEST_NUM")).intValue();
 		Integer testNumber = getTestEntityFor(tmp1, (String) fields.get("TEST_TXT"));
 		if (!testUpdate.containsKey(testNumber)) {
-			insertObject(sequence, testNumber, 0, "RESULT_DISTRIBUTION_TYPE", "DISCRETE");
+			insertObject(sequence, testNumber, 0, "RESULT_DISTRIBUTION_TYPE", "discrete");
 	    insertObject(sequence, testNumber, 0, "ANALYZABLE", "N");
 	    insertObject(sequence, testNumber, 0, "RESULT_SCALE", 1.0);  // default
       testUpdate.put(testNumber, new HashSet<Integer>());
@@ -1861,29 +2031,37 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 		String pf = null;
 		if ((flags & 0x40) == 0) {// pass/fail flag is valid
 			if ((flags & 0x80) == 0x80) {
-				pf = "F";
+				pf = "FV";
 			} else {
-				pf = "P";
+				pf = "PV";
 			}
 		}
 		Long numFail = (Long) fields.get("NUM_FAIL");
 		if(numFail == null){
 		  numFail = 0L;
 		}
+    Long failCycle = (Long) fields.get("CYCL_CNT");
+    if(failCycle == null){
+      failCycle = 0L;
+    }
 		if ((flags & 0x50) == 0) { // tested with p/f
-			insertObject(sequence, te, testNumber, "R", numFail, pf);
+			insertObject(sequence, te, testNumber, "R", failCycle, pf);
+			insertObject(sequence, te, testNumber, "FAIL_COUNT", numFail);
 		}
 		if ((flags & 0x20) == 0x20) { // aborted
-			insertObject(sequence, te, testNumber, "R", numFail, "A");
+			insertObject(sequence, te, testNumber, "R", failCycle, "FA");
+	     insertObject(sequence, te, testNumber, "FAIL_COUNT", numFail);
 		}
-		if ((flags & 0x50) == 0x50) {// test not executed
-			insertObject(sequence, te, testNumber, "R", numFail, "X");
+		if ((flags & 0x50) == 0x50) {// test not executed so not saved
+			//insertObject(sequence, te, testNumber, "R", numFail, "X");
 		}
 		if ((flags & 0x7a) == 0x40) {// tested no p/f
-			insertObject(sequence, te, testNumber, "R", numFail, "T");
+			insertObject(sequence, te, testNumber, "R", failCycle, "XV");
+	     insertObject(sequence, te, testNumber, "FAIL_COUNT", numFail);
 		}
 		if ((flags & 0xa0) == 0xa0) {// failed due to abort
-			insertObject(sequence, te, testNumber, "R", numFail, "FA");
+			insertObject(sequence, te, testNumber, "R", failCycle, "FA");
+	     insertObject(sequence, te, testNumber, "FAIL_COUNT", numFail);
 		}
 		String tmpStr = (String) fields.get("ALARM_ID");
 		if (tmpStr != null) {
@@ -1892,64 +2070,62 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 			}
 		}
     if(site == 255) return;
-    Byte opt = ((Byte) fields.get("OPT_FLAG")); // can be null
-    if (opt != null) {
-      insertObject(sequence, testNumber , 0, "FAIL_PIN", fields.get("FAIL_PIN"));
-      insertObject(sequence, testNumber , 0, "VECT_NAM", fields.get("VECT_NAM"));
-      insertObject(sequence, testNumber , 0, "TIME_SET", fields.get("TIME_SET"));
-      insertObject(sequence, testNumber , 0, "OP_CODE", fields.get("OP_CODE"));
-      insertObject(sequence, testNumber , 0, "PROG_TXT", fields.get("PROG_TXT"));
-      insertObject(sequence, testNumber , 0, "RSLT_TXT", fields.get("RSLT_TXT"));
-      int tmp = ((Long) fields.get("RTN_ICNT")).intValue();
-      if (tmp != 0) {
-        insertObject(sequence, testNumber , 0, "RTN_ICNT", fields.get("RTN_ICNT"));
-        insertObject(sequence, testNumber , 0, "RTN_INDX", fields.get("RTN_INDX"));
-        insertObject(sequence, testNumber , 0, "RTN_STAT", fields.get("RTN_STAT"));
-      }
-      tmp = ((Long) fields.get("PGM_ICNT")).intValue();
-      if (tmp != 0) {
-        insertObject(sequence, testNumber , 0, "PGM_ICNT", fields.get("PGM_ICNT"));
-        insertObject(sequence, testNumber , 0, "PGM_INDX", fields.get("PGM_INDX"));
-        insertObject(sequence, testNumber , 0, "PGM_STAT", fields.get("PGM_STAT"));
-      }
-      insertObject(sequence, testNumber , 0, "PATG_NUM", fields.get("PATG_NUM"));
-      // these are arrays
-      insertObject(sequence, testNumber , 0, "SPIN_MAP", fields.get("SPIN_MAP"));
-      // handle optional data
-      if ((opt & 0x01) == 0) {
-        insertObject(sequence, testNumber , 0, "CYCL_CNT", fields.get("CYCL_CNT"));
-      }
-      if ((opt & 0x02) == 0) {
-        insertObject(sequence, testNumber , 0, "REL_VADR", fields.get("REL_VADR"));
-      }
-      if ((opt & 0x04) == 0) {
-        insertObject(sequence, testNumber , 0, "REPT_CNT", fields.get("REPT_CNT"));
-      }
-      if ((opt & 0x08) == 0) {
-        insertObject(sequence, testNumber , 0, "NUM_FAIL", fields.get("NUM_FAIL"));
-      }
-      if ((opt & 0x10) == 0) {
-        insertObject(sequence, testNumber , 0, "XFAIL_AD", fields.get("XFAIL_AD"));
-      }
-      if ((opt & 0x20) == 0) {
-        insertObject(sequence, testNumber , 0, "YFAIL_AD", fields.get("YFAIL_AD"));
-      }
-      if ((opt & 0x40) == 0) {
-        insertObject(sequence, testNumber , 0, "VECT_OFF", fields.get("VECT_OFF"));
-      }
-    }
+//    Byte opt = ((Byte) fields.get("OPT_FLAG")); // can be null
+//    if (opt != null) {
+//      insertObject(sequence, testNumber , 0, "FAIL_PIN", fields.get("FAIL_PIN"));
+//      insertObject(sequence, testNumber , 0, "VECT_NAM", fields.get("VECT_NAM"));
+//      insertObject(sequence, testNumber , 0, "TIME_SET", fields.get("TIME_SET"));
+//      insertObject(sequence, testNumber , 0, "OP_CODE", fields.get("OP_CODE"));
+//      insertObject(sequence, testNumber , 0, "PROG_TXT", fields.get("PROG_TXT"));
+//      insertObject(sequence, testNumber , 0, "RSLT_TXT", fields.get("RSLT_TXT"));
+//      int tmp = ((Long) fields.get("RTN_ICNT")).intValue();
+//      if (tmp != 0) {
+//        insertObject(sequence, testNumber , 0, "RTN_ICNT", fields.get("RTN_ICNT"));
+//        insertObject(sequence, testNumber , 0, "RTN_INDX", fields.get("RTN_INDX"));
+//        insertObject(sequence, testNumber , 0, "RTN_STAT", fields.get("RTN_STAT"));
+//      }
+//      tmp = ((Long) fields.get("PGM_ICNT")).intValue();
+//      if (tmp != 0) {
+//        insertObject(sequence, testNumber , 0, "PGM_ICNT", fields.get("PGM_ICNT"));
+//        insertObject(sequence, testNumber , 0, "PGM_INDX", fields.get("PGM_INDX"));
+//        insertObject(sequence, testNumber , 0, "PGM_STAT", fields.get("PGM_STAT"));
+//      }
+//      insertObject(sequence, testNumber , 0, "PATG_NUM", fields.get("PATG_NUM"));
+//      // these are arrays
+//      insertObject(sequence, testNumber , 0, "SPIN_MAP", fields.get("SPIN_MAP"));
+//      // handle optional data
+//      if ((opt & 0x01) == 0) {
+//        insertObject(sequence, testNumber , 0, "CYCL_CNT", fields.get("CYCL_CNT"));
+//      }
+//      if ((opt & 0x02) == 0) {
+//        insertObject(sequence, testNumber , 0, "REL_VADR", fields.get("REL_VADR"));
+//      }
+//      if ((opt & 0x04) == 0) {
+//        insertObject(sequence, testNumber , 0, "REPT_CNT", fields.get("REPT_CNT"));
+//      }
+//      if ((opt & 0x08) == 0) {
+//        insertObject(sequence, testNumber , 0, "NUM_FAIL", fields.get("NUM_FAIL"));
+//      }
+//      if ((opt & 0x10) == 0) {
+//        insertObject(sequence, testNumber , 0, "XFAIL_AD", fields.get("XFAIL_AD"));
+//      }
+//      if ((opt & 0x20) == 0) {
+//        insertObject(sequence, testNumber , 0, "YFAIL_AD", fields.get("YFAIL_AD"));
+//      }
+//      if ((opt & 0x40) == 0) {
+//        insertObject(sequence, testNumber , 0, "VECT_OFF", fields.get("VECT_OFF"));
+//      }
+//    }
 		// now update the testText
 		updateTextText(testNumber, site, (String) fields.get("TEST_TXT"));
 	}
 
 	private void insertVur(HashMap<String, Object> fields) {
-		//TODO should we do anything with this?
-		/*int count = ((Long) fields.get("UPD_CNT")).intValue(); // num vers
+		int count = ((Long) fields.get("UPD_CNT")).intValue(); // num vers
 		Object[] list = (Object[]) fields.get("UPD_NAM");
 		for( int i = 0; i < count;i++){
-			insertObject(sequence, runID, i + 1, "VERSION", list[i]);
+			insertObject(sequence, fileID, i + 1, "stdf.UPD_NAM", list[i]);
 		}
-		*/
 	}
 	private void insertPsr(HashMap<String, Object> fields) {
 	  //TODO PAT_FILE, FILE_UID, ATPG_DSC, SRC_ID NOT SUPPORTED  
@@ -1995,14 +2171,18 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
 			for(int i = 0; i < count; i++){		
 			  _contBuffers[2].put((String)list[i]);
 			}
-    Object[] array = (Object[])fields.get("PAT_BGN");			
-    for( int i = 0; i < array.length; i++){
-        _contBuffers[0].put((Long)array[i]);
-      }
-    array = (Object[])fields.get("PAT_END");     
-    for( int i = 0; i < array.length; i++){
-        _contBuffers[1].put((Long)array[i]);
-      }
+    Object[] array = (Object[])fields.get("PAT_BGN");	
+    if(array != null){    
+      for( int i = 0; i < array.length; i++){
+          _contBuffers[0].put((Long)array[i]);
+        }
+    }
+    array = (Object[])fields.get("PAT_END");   
+    if(array != null){
+      for( int i = 0; i < array.length; i++){
+          _contBuffers[1].put((Long)array[i]);
+        }
+    }
 		}
 		// if last then save the repeating arrays
 		if(continuation == 0){
@@ -2058,7 +2238,7 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
      _continuationEid2 = testNumber;
      if (!testUpdate.containsKey(testNumber)) {
        insertObject(sequence, testNumber, 0, "STDF_REC", "STR");
-       insertObject(sequence, testNumber, 0, "RESULT_DISTRIBUTION_TYPE", "SCAN");
+       insertObject(sequence, testNumber, 0, "RESULT_DISTRIBUTION_TYPE", "scan");
        insertObject(sequence, testNumber, 0, "PATTERN_SEQ", fields.get("PSR_REF"));
        insertObject(sequence, testNumber, 0, "LOG_TYPE", fields.get("LOG_TYP"));
        testUpdate.put(testNumber, new HashSet<Integer>());
@@ -2206,12 +2386,12 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     );
     buf.append(
         "^+subpane+class=DatatableRlinda+owner=top+frameRatio=0@100;100@0+identifier=10+maintable=ritdb1+numColumns=10"
-        + "+visRows=TEST_ORDER+visCols=PART_RESULT_EVENT_ORDER"
+        + "+visRows=RESULT_ORDER+visCols=PART_RESULT_EVENT_ORDER"
         + "^+subpane+class=DataBaseView+owner=10+type=x2Left+identifier=10_x2Left+frameRatio=0@100;10@0"
         + "+format=%.3f"
         + "+function=~f1~sort~ASC~visRows"
-        + "+tuple=~source~ritdb1.entityId~ritdb1.indexId~ritdb1.name~ritdb1.value"
-        + "+rule=~left~source~?testId~0~TEST_ORDER~#visRows"
+        + "+tuple=~source~ritdb1.entityID~ritdb1.indexID~ritdb1.name~ritdb1.value"
+        + "+rule=~left~source~?testId~0~RESULT_ORDER~#visRows"
         + "+rule=~left~source~?testId~0~ENTITY_TYPE~RESULT_INFO"
         + "+rule=~left~source~?testId~0~RESULT_NUMBER~?col1"
         + "+rule=~left~source~?testId~0~RESULT_NAME~?col2"
@@ -2242,8 +2422,8 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
         + "+setRendering=~33~colors=`7`15``"
         + "+setRendering=~32~colors=`1`7``+setRendering=~34~colors=`7`27``"
         + "+setVarColor=~color~32~FAIL~34"
-        + "+tuple=~source~ritdb1.entityId~ritdb1.name~ritdb1.value"
-        + "+rule=~top~source~?eventId~_~PART_RESULT_EVENT"
+        + "+tuple=~source~ritdb1.entityID~ritdb1.name~ritdb1.value"
+        + "+rule=~top~source~?eventId~ENTITY_TYPE~PART_RESULT_EVENT"
         + "+rule=~top~source~?eventId~PART_RESULT_EVENT_ORDER~#visCols"
         + "+rule=~top~source~?eventId~PART_ID~?col1"
         + "+rule=~top~source~?eventId~PF~?col2"
@@ -2258,17 +2438,17 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
       + "+alignX1=eventId+alignX2=testId"
       + "+scrollenable=on"
       + "+format=%.3f"
-      + "+tuple=~source~ritdb1.entityId~ritdb1.indexId~ritdb1.name~ritdb1.value~ritdb1.value2"
+      + "+tuple=~source~ritdb1.entityID~ritdb1.indexID~ritdb1.name~ritdb1.value~ritdb1.value2"
       + "+rule=~data~source~?eventId~?testId~R~?data~?color"
       + "+rule=~data~source~?eventId~_~PART_RESULT_EVENT_ORDER~#visCols~_"
-      + "+rule=~data~source~?testId~_~TEST_ORDER~#visRows~_"
+      + "+rule=~data~source~?testId~_~RESULT_ORDER~#visRows~_"
       + "+rule=~data~source~?testId~_~RESULT_SCALE~?scale~_"
       + "+function=~foo~nullable~scale~data"
       );
     if(setLimits){
-      buf.append("+setVarColor=~color~33~F~34~P~33~T~33~X~33");
+      buf.append("+setVarColor=~color~33~FV~34~PV~33~XV~33~T~33");
     }else{
-      buf.append("+setVarColor=~color~33~F~33~P~33~T~33~X~33");
+      buf.append("+setVarColor=~color~33~FV~33~PV~33~T~33~XV~33");
     }
     buf.append(
         "^+menu+owner=10_y+selector=menuXY+identifier=xyMenu"
@@ -2277,10 +2457,8 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     buf.append(
         "^+menu+owner=10_x2Left+selector=menuX2+identifier=x2Menu+value=~%1031 Auto Width"
     );
-    buf.append(
-        "^+menu+owner=top+title=font+selector=menuFont+identifier=fontMenu+menuItem=~%1035 Font~10_y"
-        + "+menuItem=~%1010 SaveCsv~10_y"
-    );
+    buf.append("^+menu+owner=top+title=fileMenu+selector=menuFile+identifier=fontMenu+menuItem=~%1035 Font~10_y"
+        + "+menuItem=~%1010 SaveCsv~10_y+menuItem=~%1011 SaveSTDF~10_y");
     buf.append("^+command=createView");
     return buf.toString();
   }
@@ -2290,11 +2468,11 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     StringBuffer buf = new StringBuffer();
     buf.append(
          "^+subpane+type=x2Left"
-        + "+find=~left~col1~col2~col4 * scale~col5 * scale~col3~#visRows"
+        + "+find=~left~col1~col2~col4 * scale~col5 * scale~col3~visRows"
         + "+columnTitles=~Test Num~name~Limit min~Limit max~units"
         + "+function=~f1~sort~ASC~visRows"
-        + "+tuple=~source~ritdb1.entityId~ritdb1.indexId~ritdb1.name~ritdb1.value"
-        + "+rule=~left~source~?testId~0~TEST_ORDER~#visRows"
+        + "+tuple=~source~ritdb1.entityID~ritdb1.indexID~ritdb1.name~ritdb1.value"
+        + "+rule=~left~source~?testId~0~RESULT_ORDER~?visRows"
         + "+rule=~left~source~?testId~0~ENTITY_TYPE~RESULT_INFO"
         + "+rule=~left~source~?testId~0~RESULT_NUMBER~?col1"
         + "+rule=~left~source~?testId~0~RESULT_NAME~?col2"
@@ -2310,10 +2488,10 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
       "^+subpane+type=x1Top"
         + "+function=~f1~sort~ASC~visCols"
         + "+columnTitles=~device~result~site"
-        + "+find=~top~col1~col2~col5~#visCols"
-        + "+tuple=~source~ritdb1.entityId~ritdb1.name~ritdb1.value"
-        + "+rule=~top~source~?eventId~_~PART_RESULT_EVENT"
-        + "+rule=~top~source~?eventId~PART_RESULT_EVENT_ORDER~#visCols"
+        + "+find=~top~col1~col2~col5~visCols"
+        + "+tuple=~source~ritdb1.entityID~ritdb1.name~ritdb1.value"
+        + "+rule=~top~source~?eventId~ENTITY_TYPE~PART_RESULT_EVENT"
+        + "+rule=~top~source~?eventId~PART_RESULT_EVENT_ORDER~?visCols"
         + "+rule=~top~source~?eventId~PART_ID~?col1"
         + "+rule=~top~source~?eventId~PF~?col2"
         + "+rule=~top~source~?eventId~SITE_INFO_EID~?siteId"
@@ -2321,70 +2499,18 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     );
     buf.append(
       "^+subpane+type=y"
-      + "+find=~mid~data * scale~#visRows~#visCols"
-      + "+tuple=~source~ritdb1.entityId~ritdb1.indexId~ritdb1.name~ritdb1.value~ritdb1.value2"
+      + "+find=~mid~data * scale~visRows~visCols"
+      + "+tuple=~source~ritdb1.entityID~ritdb1.indexID~ritdb1.name~ritdb1.value~ritdb1.value2"
       + "+rule=~data~source~?eventId~?testId~R~?data~_"
-      + "+rule=~data~source~?eventId~_~PART_RESULT_EVENT_ORDER~#visCols~_"
-      + "+rule=~data~source~?testId~_~TEST_ORDER~#visRows~_"
+      + "+rule=~data~source~?eventId~_~PART_RESULT_EVENT_ORDER~?visCols~_"
+      + "+rule=~data~source~?testId~_~RESULT_ORDER~?visRows~_"
       + "+rule=~data~source~?testId~_~RESULT_SCALE~?scale~_"
       + "+function=~foo~nullable~scale~data"
       );
     return buf.toString();
   }
 
-//  private String generateCsvScript(String limits){  // generates a CBOR map
-//    SmCborBuffer buffer = new SmCborBuffer();
-//    GuruUtilities.insertRiri(
-//        "^+toppane+identifier=top+type=viewModel+windowSize=100@100+label=" + fileName
-//    , buffer);
-//    GuruUtilities.insertRiri(
-//        "^+subpane+class=DatatableRlinda+owner=top+frameRatio=0@100;100@0+identifier=10+maintable=ritdb1+numColumns=10"
-//        ,buffer);
-//    GuruUtilities.insertRiri(
-//         "^+subpane+class=DataBaseView+owner=10+type=x2Left+identifier=10_x2Left+frameRatio=0@100;10@0"
-//        + "+function=~f1~sort~ASC~testId"
-//        + "+tuple=~source~ritdb1.entityId~ritdb1.indexId~ritdb1.name~ritdb1.value"
-//        + "+rule=~left~source~?testId~0~TEST_ORDER~?visRows"
-//        + "+rule=~left~source~?testId~0~ENTITY_TYPE~RESULT_INFO"
-//        + "+rule=~left~source~?testId~0~RESULT_NUMBER~?col1"
-//        + "+rule=~left~source~?testId~0~RESULT_NAME~?col2"
-//        + "+rule=~left~source~?testId~0~RESULT_UNITS_LABEL~?col3"
-//        + "+columnTitles=~Test Num~name~units~Limit min~Limit max"
-//        + "+find=~left~?col1~?col2~?col3~?col4 * ?scale~?col5 * ?scale~#visRows"
-//        + "+rule=~left~source~?limitId~0~ENTITY_TYPE~RESULT_LIMIT_SET"
-//        + "+rule=~left~source~?limitId~?testId~LL~?col4"
-//        + "+rule=~left~source~?limitId~?testId~UL~?col5"
-//        + "+function=~left~nullable~limitId~col3~scale~col2"
-//        + "+rule=~left~source~?testId~0~RESULT_SCALE~?scale"
-//        + "+rule=~left~source~?limitId~0~LIMIT_SET_NAME~" + limits
-//        , buffer);
-//    GuruUtilities.insertRiri(
-//      "^+subpane+class=DataBaseView+owner=10+type=x1Top+identifier=10_x1Top+frameRatio=0@100;100@90+function=~f1~sort~ASC~visCols"
-//        + "+columnTitles=~device~result~site"
-//        + "+find=~top~?col1~?col2~col5"
-//        + "+tuple=~source~ritdb1.entityId~ritdb1.name~ritdb1.value"
-//        + "+rule=~top~source~?eventId~_~PART_RESULT_EVENT"
-//        + "+rule=~top~source~?eventId~PART_RESULT_EVENT_ORDER~?visCols"
-//        + "+rule=~top~source~?eventId~PART_ID~?col1"
-//        + "+rule=~top~source~?eventId~PF~?col2"
-//        + "+rule=~top~source~?eventId~SITE_INFO_EID~?siteId"
-//        + "+rule=~top~source~?siteId~PHYSICAL_SITE_NUMBER~?col5"
-//        , buffer);
-//    GuruUtilities.insertRiri(
-//      "^+subpane+class=DataBaseView+owner=10+type=y+columnTitles=data"
-//      + "+find=~mid~?data * ?scale~?color~?eventId~?testId~#visRows~#visCols"
-//      + "+identifier=10_y+frameRatio=10@90;100@0+display=data+setRendering=~33~colors=`1`7``+setRendering=~34~colors=`27`7``"
-//      + "+alignX1=eventId+alignX2=testId"
-//      + "+scrollenable=on"
-//      + "+tuple=~source~ritdb1.entityId~ritdb1.indexId~ritdb1.name~ritdb1.value~ritdb1.value2"
-//      + "+rule=~data~source~?eventId~?testId~R~?data~?color"
-//      + "+rule=~data~source~?eventId~_~PART_RESULT_EVENT_ORDER~?visCols~_"
-//      + "+rule=~data~source~?testId~_~TEST_ORDER~?visRows~_"
-//      + "+rule=~data~source~?testId~_~RESULT_SCALE~?scale~_"
-//      + "+function=~foo~nullable~scale~data"
-//      , buffer);
-//    return GuruUtilities.asString(buffer.toBytes());
-//  }
+
   
   /**Return the 16 char SHA1 hash hex string for bytes
    * Used to hide names
@@ -2392,10 +2518,10 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
   private String nameHash(Object string) {
     if(!_cleanProp) return (String) string;
     try { 
-      MessageDigest md=MessageDigest.getInstance("SHA"); 
+      MessageDigest md=MessageDigest.getInstance("SHA-1"); 
       return (GuruUtilities.hexIt(md.digest(GuruUtilities.asBytes((String)string))).substring(25));
     } 
-    catch (Exception e) { return ""; } //this would only happen if "SHA" was no longer a known thing
+    catch (Exception e) { return ""; } //this would only happen if "SHA-1" was no longer a known thing
   }
   /**
    * convent sites > 255 using head mod 16.  Max = 1024
@@ -2410,6 +2536,19 @@ public class Stdf4ToRITdbTranslator implements RecordVisitor {
     if(head == 49) finalSite = finalSite + 768;
     if(head == 65) finalSite = 1024;
     return finalSite;
+  }
+  
+  public int getSite(int site){
+    if(siteInfoEid.get(site) == null){
+      int siteEid = ++entityID;
+      siteInfoEid.put(Integer.parseInt(Integer.toString(site)), siteEid);
+      insertObject(sequence, siteEid, 0, "ENTITY_TYPE", "SITE_INFO");
+      insertObject(sequence, siteEid, 0, "SITE_ID", site);
+      insertObject(sequence, siteEid, 0, "PHYSICAL_SITE_NUMBER", site);
+      insertObject(sequence, siteEid, 0, "ACTIVE_SITE", "T"); 
+      insertObject(sequence, prodID, 0, "SITE_COUNT", 1);
+    }
+    return siteInfoEid.get(site);
   }
   
 }

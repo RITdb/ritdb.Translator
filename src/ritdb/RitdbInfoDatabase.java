@@ -15,7 +15,6 @@ import java.util.Iterator;
 import java.util.TimeZone;
 import org.sqlite.SQLiteJDBCLoader;
 import rtalk.portal.NodeIdentifier;
-import rtalk.util.GuruUtilities;
 import rtalk.util.RtalkLoggerInterface;
 
 /**
@@ -165,9 +164,11 @@ public class RitdbInfoDatabase {
         if(key.equalsIgnoreCase("ri.sys.ObjHash")) objHash = val;
         if (key != null && val != null) {
           narrowPrepStatement.setLong(1, ++sequence);
-          narrowPrepStatement.setLong(2, entityID); //cid
+          narrowPrepStatement.setLong(2, entityID); 
+          narrowPrepStatement.setLong(3, 0); //index
           narrowPrepStatement.setString(4, key); //gkey
           narrowPrepStatement.setString(5, val); //gval
+          narrowPrepStatement.setNull(6,  java.sql.Types.CHAR);
           narrowPrepStatement.addBatch();
           narrowPrepStatement.executeBatch();
         }
@@ -198,13 +199,6 @@ public class RitdbInfoDatabase {
       return lastSeq + 1L;
       }
     }  
-  
-  public  String newCID() {
-    long time = NodeIdentifier.guruTimeMillis();
-    long lastSequence = (time % 1000 ) / 10; // 10 ms steps
-    String timeString = GuruUtilities.asString(GuruUtilities.convertBase36(((time / 1000) * 1296) + lastSequence));
-    return _nodeId.cellID + timeString;
-  }
   
   /**Utility function to return the number of rows in a database.
    * note: expects an already open SQL Connection to database.

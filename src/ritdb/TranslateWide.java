@@ -7,8 +7,9 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.HashMap;
+import java.util.function.Supplier;
 
-import rtalk.RtalkConsoleLogger;
+import rtalk.util.RtalkConsoleLogger;
 import rtalk.util.RtalkLoggerInterface;
 
 public class TranslateWide implements RtalkLoggerInterface{
@@ -182,6 +183,36 @@ public class TranslateWide implements RtalkLoggerInterface{
     public void log(String message) {
       // TODO Auto-generated method stub
       System.out.println(message);
+    }
+
+    @Override
+    public void logError(String message) {
+      // TODO Auto-generated method stub
+      
+    }
+
+    @Override
+    public void logDebug(String message) {
+      // TODO Auto-generated method stub
+      
+    }
+
+    @Override
+    public void logVerbose(String message) {
+      // TODO Auto-generated method stub
+      
+    }
+
+    @Override
+    public void logError(Exception e) {
+      // TODO Auto-generated method stub
+      
+    }
+
+    @Override
+    public void logVerbose(Supplier msg) {
+      // TODO Auto-generated method stub
+      
     }
 
 
